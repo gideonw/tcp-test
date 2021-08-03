@@ -1,10 +1,12 @@
 use anyhow::Result;
 // use std::collections::HashMap;
 use std::env;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::{spawn, JoinHandle};
 
 #[tokio::main]
 async fn main() {
@@ -12,9 +14,7 @@ async fn main() {
     if args.iter().count() > 1 {
         let b = Broker::new();
         let c_b = b.clone();
-        let th = tokio::spawn(async move {
-            c_b.process();
-        });
+        let th = spawn(async move { c_b.process().await });
 
         if let Err(e) = b.listen("localhost:8080").await {
             panic!("Error listening {}", e)
@@ -72,6 +72,7 @@ impl Executor {
                 Ok(ready) if ready.is_readable() => {
                     let mut data = vec![0; 1024];
                     match self.socket.try_read(&mut data) {
+                        Ok(0) => break,
                         Ok(n) => {
                             println!("read {} bytes", n);
                         }
@@ -91,7 +92,7 @@ impl Executor {
                     println!("Unknown error pattern")
                 }
             }
-            thread::sleep_ms(1000);
+            thread::sleep(std::time::Duration::from_millis(1000));
         }
     }
 
@@ -102,14 +103,14 @@ impl Executor {
 
 // ----------------------------------------------------------------------------
 // ----------------------------------------------------------------------------
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct BrokerDispatcher {
     cmd_stack: CommandStack,
-    socket: Arc<TcpStream>,
+    socket: TcpStream,
 }
 
 impl BrokerDispatcher {
-    pub async fn handle_tcp(&self) {
+    pub async fn handle_tcp(self) {
         loop {
             // Recieve
             match self
@@ -120,6 +121,7 @@ impl BrokerDispatcher {
                 Ok(ready) if ready.is_readable() => {
                     let mut data = vec![0; 1024];
                     match self.socket.try_read(&mut data) {
+                        Ok(0) => break,
                         Ok(n) => {
                             println!("read {} bytes", n);
                         }
@@ -135,26 +137,28 @@ impl BrokerDispatcher {
                 Ok(_) => {
                     println!("Unknown ok pattern")
                 }
-                Err(_) => {
-                    println!("Unknown error pattern")
+                Err(e) => {
+                    println!("Unknown error pattern {}", e)
                 }
             }
-            thread::sleep_ms(1000);
+            thread::sleep(std::time::Duration::from_millis(1000));
         }
     }
 }
 
-type ExecutorList = Arc<RwLock<Vec<Arc<BrokerDispatcher>>>>;
+// type ExecutorList = Arc<RwLock<Vec<BrokerDispatcher>>>;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Broker {
-    connections: ExecutorList,
+    // connections: ExecutorList,
+    tasks: Arc<Vec<JoinHandle<()>>>,
 }
 
 impl Broker {
     fn new() -> Self {
         Self {
-            connections: Arc::new(RwLock::new(Vec::new())),
+            // connections: Arc::new(RwLock::new(Vec::new())),
+            tasks: Arc::new(Vec::new()),
         }
     }
     async fn listen(&self, addr: &str) -> Result<()> {
@@ -165,13 +169,18 @@ impl Broker {
             match listener.accept().await {
                 Ok((socket, client_addr)) => {
                     println!("New connection on {}", client_addr);
-                    let broker_disp = Arc::new(BrokerDispatcher {
-                        cmd_stack: CommandStack::new(),
-                        socket: Arc::new(socket),
-                    });
-                    let c_broker_disp = broker_disp.clone();
-                    self.connections.write().unwrap().push(broker_disp);
-                    tokio::spawn(async move { c_broker_disp.handle_tcp().await });
+                    let (in_send, in_recv) = channel();
+                    let (out_send, out_recv) = channel();
+                    let c_in_recv = Arc::new(Mutex::new(in_recv));
+
+                    let broker_disp = BrokerDispatcher {
+                        cmd_stack: CommandStack::new(c_in_recv.clone(), out_send),
+                        socket: socket,
+                    };
+                    // let c_broker_disp = broker_disp.clone();
+                    // self.connections.write().unwrap().push(broker_disp);
+                    spawn(async move { broker_disp.handle_tcp().await });
+                    // self.tasks.push(new_task);
                 }
                 Err(e) => {
                     println!("Error accepting connection: {}", e)
@@ -179,21 +188,22 @@ impl Broker {
             }
         }
     }
-    fn process(&self) {
+    async fn process(&self) {
         loop {
             println!("Proc");
             // loops over conns and process commands in and out
-            for conn in self.connections.write().unwrap().iter_mut() {
-                if let Some(cmd) = conn.cmd_stack.pop_in() {
-                    println!("CMD IN: {:?}", cmd);
-                }
+            for conn in self.tasks.iter() {
+                // conn
+                // if let Some(cmd) = conn. {
+                //     println!("CMD IN: {:?}", cmd);
+                // }
 
-                conn.cmd_stack.push_out(Command {
-                    cmd: b'A',
-                    bytes: Vec::new(),
-                });
+                // conn.cmd_stack.push_out(Command {
+                //     cmd: b'A',
+                //     bytes: Vec::new(),
+                // });
             }
-            thread::sleep_ms(1000);
+            thread::sleep(std::time::Duration::from_millis(1000));
         }
     }
 }
@@ -201,13 +211,13 @@ impl Broker {
 // ----------------------------------------------------------------------------
 // ----------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Command {
     cmd: u8,
     bytes: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct CommandBuffer {
     queue: Vec<Command>,
 }
@@ -229,31 +239,30 @@ impl CommandBuffer {
 }
 
 /// Thread safe command stack
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct CommandStack {
-    cmds_in: Arc<RwLock<CommandBuffer>>,
-    cmds_out: Arc<RwLock<CommandBuffer>>,
+    cmds_in: Arc<Mutex<Receiver<Command>>>,
+    cmds_out: Sender<Command>,
 }
 
 impl CommandStack {
-    pub fn new() -> Self {
-        Self {
-            cmds_in: Arc::new(RwLock::new(CommandBuffer::new())),
-            cmds_out: Arc::new(RwLock::new(CommandBuffer::new())),
+    pub fn new(cmds_in: Arc<Mutex<Receiver<Command>>>, cmds_out: Sender<Command>) -> Self {
+        Self { cmds_in, cmds_out }
+    }
+
+    pub fn recv(self, cmd: Command) -> Option<Command> {
+        match self.cmds_in.lock().unwrap().recv() {
+            Ok(cmd) => Some(cmd),
+            Err(e) => {
+                println!("Unable to recv from Command Stack {}", e);
+                None
+            }
         }
     }
-
-    pub fn push_in(&mut self, cmd: Command) {
-        self.cmds_in.write().unwrap().push(cmd)
-    }
-    pub fn push_out(&mut self, cmd: Command) {
-        self.cmds_out.write().unwrap().push(cmd)
-    }
-
-    pub fn pop_in(&mut self) -> Option<Command> {
-        self.cmds_in.write().unwrap().pop()
-    }
-    pub fn pop_out(&mut self) -> Option<Command> {
-        self.cmds_out.write().unwrap().pop()
+    pub fn send(self, cmd: Command) {
+        match self.cmds_out.send(cmd) {
+            Ok(_) => {}
+            Err(e) => println!("Unable to send to Command Stack {}", e),
+        }
     }
 }
