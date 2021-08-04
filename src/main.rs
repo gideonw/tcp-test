@@ -1,26 +1,28 @@
 use anyhow::Result;
 // use std::collections::HashMap;
+// use futures::lock::Mutex;
 use std::env;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::thread;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::io::Interest;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 use tokio::task::{spawn, JoinHandle};
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
     if args.iter().count() > 1 {
-        let b = Broker::new();
+        let b = Arc::new(Broker::new());
         let c_b = b.clone();
-        let th = spawn(async move { c_b.process().await });
+        let listen = b.listen("localhost:8080");
+        spawn(b.process());
 
-        if let Err(e) = b.listen("localhost:8080").await {
+        if let Err(e) = listen.await {
             panic!("Error listening {}", e)
         }
-
-        let _ = th.await;
+        join!();
     } else {
         let mut e = Executor::connect("localhost:8080".to_string())
             .await
@@ -110,6 +112,9 @@ struct BrokerDispatcher {
 }
 
 impl BrokerDispatcher {
+    // async fn get_next_cmd(&mut self) -> Option<Command> {
+    //     self.cmd_stack.recv()
+    // }
     pub async fn handle_tcp(self) {
         loop {
             // Recieve
@@ -124,16 +129,25 @@ impl BrokerDispatcher {
                         Ok(0) => break,
                         Ok(n) => {
                             println!("read {} bytes", n);
+                            self.cmd_stack.clone().send(Command {
+                                cmd: b'A',
+                                bytes: data,
+                            })
                         }
                         Err(_) => continue,
                     }
                 }
-                Ok(ready) if ready.is_writable() => match self.socket.try_write(b"hello world") {
-                    Ok(n) => {
-                        println!("write {} bytes", n);
+                Ok(ready) if ready.is_writable() => {
+                    let cmd_stack = self.cmd_stack.clone();
+                    if cmd_stack.recv().await.is_some() {
+                        match self.socket.try_write(b"hello world") {
+                            Ok(n) => {
+                                println!("write {} bytes", n);
+                            }
+                            Err(_) => continue,
+                        }
                     }
-                    Err(_) => continue,
-                },
+                }
                 Ok(_) => {
                     println!("Unknown ok pattern")
                 }
@@ -146,22 +160,22 @@ impl BrokerDispatcher {
     }
 }
 
-// type ExecutorList = Arc<RwLock<Vec<BrokerDispatcher>>>;
+type ExecutorList = Arc<RwLock<Vec<CommandStack>>>;
 
 #[derive(Debug, Clone)]
 struct Broker {
-    // connections: ExecutorList,
+    connections: ExecutorList,
     tasks: Arc<Vec<JoinHandle<()>>>,
 }
 
 impl Broker {
     fn new() -> Self {
         Self {
-            // connections: Arc::new(RwLock::new(Vec::new())),
+            connections: Arc::new(RwLock::new(Vec::new())),
             tasks: Arc::new(Vec::new()),
         }
     }
-    async fn listen(&self, addr: &str) -> Result<()> {
+    async fn listen(self, addr: &str) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
         println!("Listening on {}", addr);
 
@@ -172,14 +186,20 @@ impl Broker {
                     let (in_send, in_recv) = channel();
                     let (out_send, out_recv) = channel();
                     let c_in_recv = Arc::new(Mutex::new(in_recv));
+                    let c_out_recv = Arc::new(Mutex::new(out_recv));
 
                     let broker_disp = BrokerDispatcher {
                         cmd_stack: CommandStack::new(c_in_recv.clone(), out_send),
                         socket: socket,
                     };
                     // let c_broker_disp = broker_disp.clone();
-                    // self.connections.write().unwrap().push(broker_disp);
-                    spawn(async move { broker_disp.handle_tcp().await });
+                    {
+                        self.connections
+                            .write()
+                            .unwrap()
+                            .push(CommandStack::new(c_out_recv.clone(), in_send));
+                    }
+                    spawn(broker_disp.handle_tcp());
                     // self.tasks.push(new_task);
                 }
                 Err(e) => {
@@ -188,7 +208,7 @@ impl Broker {
             }
         }
     }
-    async fn process(&self) {
+    async fn process(self) {
         loop {
             println!("Proc");
             // loops over conns and process commands in and out
@@ -239,7 +259,7 @@ impl CommandBuffer {
 }
 
 /// Thread safe command stack
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CommandStack {
     cmds_in: Arc<Mutex<Receiver<Command>>>,
     cmds_out: Sender<Command>,
@@ -250,8 +270,8 @@ impl CommandStack {
         Self { cmds_in, cmds_out }
     }
 
-    pub fn recv(self, cmd: Command) -> Option<Command> {
-        match self.cmds_in.lock().unwrap().recv() {
+    pub async fn recv(self) -> Option<Command> {
+        match self.cmds_in.lock().await.try_recv() {
             Ok(cmd) => Some(cmd),
             Err(e) => {
                 println!("Unable to recv from Command Stack {}", e);
