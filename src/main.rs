@@ -1,16 +1,16 @@
 use anyhow::{anyhow, Result};
 // use std::collections::HashMap;
 // use futures::lock::Mutex;
-use std::convert::{From, Into, TryFrom, TryInto};
+use std::convert::{From, TryFrom};
 use std::env;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use tokio::io::{Interest, Ready};
 use tokio::join;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{channel, unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::Mutex;
-use tokio::task::{spawn, JoinHandle};
+use tokio::task::spawn;
 
 #[tokio::main]
 async fn main() {
@@ -83,7 +83,7 @@ impl Executor {
                         Err(_) => continue,
                     }
                 }
-                Ok(ready) if ready.is_writable() => match self.socket.try_write(b"A\0test") {
+                Ok(ready) if ready.is_writable() => match self.socket.try_write(b"Atest") {
                     Ok(n) => {
                         println!("write {} bytes", n);
                     }
@@ -96,7 +96,7 @@ impl Executor {
                     println!("Unknown error pattern")
                 }
             }
-            thread::sleep(std::time::Duration::from_millis(10));
+            // thread::sleep(std::time::Duration::from_millis(50));
         }
     }
 
@@ -141,16 +141,22 @@ impl BrokerDispatcher {
     }
     pub async fn handle_tcp(mut self) {
         loop {
+            println!("tcp - loop");
             // Recieve
             match self.socket_ready().await {
                 Ok(ready) if ready.is_readable() => {
+                    println!("tcp - read");
+
                     let mut data: Vec<u8> = vec![0; 1024];
                     match self.socket_try_read(&mut data).await {
                         Ok(0) => break,
                         Ok(n) => {
                             println!("read {} bytes", n);
                             match Command::try_from(data) {
-                                Ok(cmd) => self.send_command(cmd).await,
+                                Ok(cmd) => {
+                                    println!("tcp - send");
+                                    self.send_command(cmd).await
+                                }
                                 Err(_) => continue,
                             }
                         }
@@ -158,8 +164,10 @@ impl BrokerDispatcher {
                     }
                 }
                 Ok(ready) if ready.is_writable() => {
+                    println!("tcp - recv");
                     if let Some(cmd) = self.recv_command().await {
                         let w_cmd: Vec<u8> = Vec::from(cmd);
+                        println!("tcp - write");
                         match self.socket_try_write(&w_cmd).await {
                             Ok(n) => {
                                 println!("write {} bytes", n);
@@ -175,7 +183,8 @@ impl BrokerDispatcher {
                     println!("Unknown error pattern {}", e)
                 }
             }
-            thread::sleep(std::time::Duration::from_millis(10));
+            println!("tcp - sleep");
+            // thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }
@@ -185,14 +194,14 @@ type ExecutorList = Arc<Mutex<Vec<CommandStack>>>;
 #[derive(Debug, Clone)]
 struct Broker {
     connections: ExecutorList,
-    tasks: Arc<Vec<JoinHandle<()>>>,
+    // tasks: Arc<Vec<JoinHandle<()>>>,
 }
 
 impl Broker {
     fn new() -> Self {
         Self {
             connections: Arc::new(Mutex::new(Vec::new())),
-            tasks: Arc::new(Vec::new()),
+            // tasks: Arc::new(Vec::new()),
         }
     }
     async fn listen(&self, addr: &str) -> Result<()> {
@@ -203,8 +212,8 @@ impl Broker {
             match listener.accept().await {
                 Ok((socket, client_addr)) => {
                     println!("New connection on {}", client_addr);
-                    let (in_send, in_recv) = unbounded_channel();
-                    let (out_send, out_recv) = unbounded_channel();
+                    let (in_send, in_recv) = channel(64);
+                    let (out_send, out_recv) = channel(64);
                     // let c_in_recv = Arc::new(Mutex::new(in_recv));
                     // let c_out_recv = Arc::new(Mutex::new(out_recv));
 
@@ -250,19 +259,24 @@ impl Broker {
         loop {
             println!("Proc");
             // loops over conns and process commands in and out
-            let mut conns = self.connections.lock().await;
-            for conn in conns.iter_mut() {
-                if let Some(cmd) = conn.recv().await {
-                    println!("CMD IN: {:?}", cmd);
-                }
+            {
+                let mut conns = self.connections.lock().await;
+                println!("Proc - lock conn");
 
-                conn.send(Command {
-                    cmd: b'A',
-                    bytes: Vec::new(),
-                })
-                .await;
+                for conn in conns.iter_mut() {
+                    if let Some(cmd) = conn.recv().await {
+                        println!("CMD IN: {:?}", cmd);
+                    }
+                    conn.send(Command {
+                        cmd: b'A',
+                        bytes: Vec::new(),
+                    })
+                    .await;
+                }
             }
-            thread::sleep(std::time::Duration::from_millis(10));
+            println!("Proc - sleep");
+
+            // thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }
@@ -301,63 +315,6 @@ impl From<Command> for Vec<u8> {
     }
 }
 
-// impl From<Vec<u8>> for Command {
-//     // fn into(self) -> Vec<u8> {
-//     //     let ret = vec![self.cmd];
-//     //     for i in self.bytes.iter() {
-//     //         ret.push(*i);
-//     //     }
-//     //     ret
-//     // }
-//     fn from(v: Vec<u8>) -> Self {
-//         if v.len() <= 1 {
-//             panic!("Unable to create command from vec<u8>")
-//         }
-//         Self {
-//             cmd: v[0],
-//             bytes: v[1..].to_vec(),
-//         }
-//     }
-// }
-
-// impl From<&Vec<u8>> for Command {
-//     // fn into(self) -> Vec<u8> {
-//     //     let ret = vec![self.cmd];
-//     //     for i in self.bytes.iter() {
-//     //         ret.push(*i);
-//     //     }
-//     //     ret
-//     // }
-//     fn from(v: &Vec<u8>) -> Self {
-//         if v.len() <= 1 {
-//             panic!("Unable to create command from vec<u8>")
-//         }
-//         Self {
-//             cmd: v[0],
-//             bytes: v[1..].to_vec(),
-//         }
-//     }
-// }
-
-// impl From<&mut Vec<u8>> for Command {
-//     // fn into(self) -> Vec<u8> {
-//     //     let ret = vec![self.cmd];
-//     //     for i in self.bytes.iter() {
-//     //         ret.push(*i);
-//     //     }
-//     //     ret
-//     // }
-//     fn from(v: &mut Vec<u8>) -> Self {
-//         if v.len() <= 1 {
-//             panic!("Unable to create command from vec<u8>")
-//         }
-//         Self {
-//             cmd: v[0],
-//             bytes: v[1..].to_vec(),
-//         }
-//     }
-// }
-
 #[derive(Debug)]
 struct CommandBuffer {
     queue: Vec<Command>,
@@ -382,17 +339,18 @@ impl CommandBuffer {
 /// Thread safe command stack
 #[derive(Debug)]
 struct CommandStack {
-    cmds_in: UnboundedReceiver<Command>,
-    cmds_out: UnboundedSender<Command>,
+    cmds_in: Receiver<Command>,
+    cmds_out: Sender<Command>,
 }
 
 impl CommandStack {
-    pub fn new(cmds_in: UnboundedReceiver<Command>, cmds_out: UnboundedSender<Command>) -> Self {
+    pub fn new(cmds_in: Receiver<Command>, cmds_out: Sender<Command>) -> Self {
         Self { cmds_in, cmds_out }
     }
 
     pub async fn recv(&mut self) -> Option<Command> {
         self.cmds_in.recv().await
+        // self.cmds_in.recv().await
         //  {
         //     Ok(cmd) => Some(cmd),
         //     Err(e) => {
@@ -402,7 +360,7 @@ impl CommandStack {
         // }
     }
     pub async fn send(&self, cmd: Command) {
-        match self.cmds_out.send(cmd) {
+        match self.cmds_out.send(cmd).await {
             Ok(_) => {}
             Err(e) => println!("Unable to send to Command Stack {}", e),
         }
